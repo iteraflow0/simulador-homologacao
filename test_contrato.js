@@ -4,7 +4,7 @@
 
 const http = require("http");
 
-const BASE = "http://localhost:3000";
+let BASE;
 
 function request(method, path, body = null, headers = {}) {
   return new Promise((resolve, reject) => {
@@ -116,6 +116,14 @@ async function runTests() {
   });
   assert(frete.status === 200 && Array.isArray(frete.body) && frete.body.length >= 2, "POST Melhor Envio calculate retorna opções de frete (PAC/SEDEX)");
   assert(frete.body.some(o => o.name === "PAC") && frete.body.some(o => o.name === "SEDEX"), "Melhor Envio contém PAC e SEDEX");
+  const quotes = [{ name: 'PAC', price: '65.59', custom_price: '65.59', delivery_time: 7, company: {name:'Correios'} },
+                  { name: 'SEDEX', price: '93.56', custom_price: '93.56', delivery_time: 3, company: {name:'Correios'} }];
+  const seeded = await request('POST', '/semente/historico', { conversa_id:'101', mensagens:[], frete_fixture:[{cep:'16901105',resposta:quotes}] });
+  assert(seeded.body.fretes_semeados===1, 'Cotação real semeada e confirmada');
+  const real = await request('POST', '/api/v2/me/shipment/calculate', {to:{postal_code:'16901105'}});
+  assert(JSON.stringify(real.body)===JSON.stringify(quotes), 'Preço e prazo devolvidos são idênticos à fixture real');
+  const unknown = await request('POST', '/api/v2/me/shipment/calculate', {to:{postal_code:'01001000'}});
+  assert(unknown.status===422, 'CEP sem fixture real não recebe preço sintético');
 
   // 9. Painel de registro
   const reg = await request("GET", "/registro?conversa_id=101", null, {
@@ -130,24 +138,28 @@ async function runTests() {
 
   if (pass === total) {
     console.log("Contratos do Simulador 100% VALIDADOS!");
-    process.exit(0);
+    process.exitCode = 0;
   } else {
-    process.exit(1);
+    process.exitCode = 1;
   }
 }
 
 // Inicia servidor temporario se chamado diretamente
 if (require.main === module) {
-  const child = require("child_process").spawn("node", ["server.js"], {
-    cwd: __dirname,
-    stdio: "inherit"
-  });
-
-  setTimeout(async () => {
+  process.env.SIMULADOR_LOCAL_ENV = '0';
+  process.env.REGISTRO_TOKEN = 'iteraflow-homolog-token'; // Apenas servidor efêmero local, sem dados reais.
+  delete process.env.SUPABASE_HOMOLOG_URL;
+  delete process.env.SUPABASE_HOMOLOG_SERVICE_ROLE_KEY;
+  const app = require('./server');
+  const server = app.listen(0, '127.0.0.1', async () => {
+    BASE = `http://127.0.0.1:${server.address().port}`;
     try {
       await runTests();
+    } catch (error) {
+      console.error(error);
+      process.exitCode = 1;
     } finally {
-      child.kill();
+      server.close();
     }
-  }, 1000);
+  });
 }

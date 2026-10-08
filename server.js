@@ -7,10 +7,12 @@ const express = require("express");
 const cors = require("cors");
 const fs = require("fs");
 const path = require("path");
+const multer = require("multer");
+const crypto = require("crypto");
 
 // Tenta carregar variaveis do ambiente local se disponivel
 const localEnvPath = "D:\\Iteraflow\\_dados_locais\\supabase_homolog.env";
-if (fs.existsSync(localEnvPath)) {
+if (process.env.SIMULADOR_LOCAL_ENV !== '0' && fs.existsSync(localEnvPath)) {
   const content = fs.readFileSync(localEnvPath, "utf-8");
   for (const line of content.split("\n")) {
     const trimmed = line.trim();
@@ -28,9 +30,10 @@ if (fs.existsSync(localEnvPath)) {
 const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_HOMOLOG_URL;
 const SUPABASE_KEY = process.env.SUPABASE_HOMOLOG_SERVICE_ROLE_KEY;
-const REGISTRO_TOKEN = process.env.REGISTRO_TOKEN || "iteraflow-homolog-token";
+const REGISTRO_TOKEN = process.env.REGISTRO_TOKEN || crypto.randomBytes(32).toString('hex');
 
 const app = express();
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024, files: 5, fields: 15, parts: 20 } });
 app.use(cors());
 app.use(express.json({ limit: "25mb" }));
 app.use(express.urlencoded({ extended: true, limit: "25mb" }));
@@ -39,6 +42,9 @@ app.use(express.urlencoded({ extended: true, limit: "25mb" }));
 const memoriaConversas = new Map(); // conversaId -> Array de mensagens
 const memoriaLabels = new Map();     // conversaId -> Array de strings
 const memoriaEventos = [];          // Todos os eventos recebidos
+const memoriaFretes = new Map();
+let freteFixtureAtivo = false;
+let conversaFixtureFrete = null;
 
 // Garante diretorio de logs locais
 const LOGS_DIR = path.join(__dirname, "logs");
@@ -102,7 +108,8 @@ app.get("/health", (req, res) => {
   res.json({
     status: "ok",
     service: "simulador-homologacao",
-    version: "1.0.0",
+    version: "1.1.0",
+    capabilities: { multipart_attachments: true, attachment_sha256: true, real_freight_fixtures: true },
     uptime: process.uptime(),
     timestamp: new Date().toISOString()
   });
@@ -130,9 +137,17 @@ app.get("/api/v1/accounts/:accountId/conversations/:conversationId/messages", as
 });
 
 // POST Nova Mensagem / Nota Interna / Anexo
-app.post("/api/v1/accounts/:accountId/conversations/:conversationId/messages", async (req, res) => {
+app.post("/api/v1/accounts/:accountId/conversations/:conversationId/messages", upload.array('attachments[]', 5), async (req, res) => {
   const { conversationId } = req.params;
   const body = req.body || {};
+  const received = (req.files || []).map(file => ({
+    file_name: path.basename(file.originalname), content_type: file.mimetype,
+    file_size: file.size, sha256: crypto.createHash('sha256').update(file.buffer).digest('hex'),
+    recebido_binario: true
+  }));
+  if (!String(body.content || '').trim() && !received.length) {
+    return res.status(400).json({ error: 'Mensagem vazia ou anexo sem bytes recebidos' });
+  }
   const isPrivate = body.private === true || body.private === "true";
 
   const msgId = 900000 + (Date.now() % 100000);
@@ -149,7 +164,7 @@ app.post("/api/v1/accounts/:accountId/conversations/:conversationId/messages", a
       name: "Letícia (IA Homolog)",
       type: "user"
     },
-    attachments: body.attachments || []
+    attachments: received
   };
 
   if (!memoriaConversas.has(String(conversationId))) {
@@ -157,7 +172,7 @@ app.post("/api/v1/accounts/:accountId/conversations/:conversationId/messages", a
   }
   memoriaConversas.get(String(conversationId)).push(novaMsg);
 
-  await registrarSaida("chatwoot", req.originalUrl, "POST", body, novaMsg, conversationId);
+  await registrarSaida("chatwoot", req.originalUrl, "POST", { ...body, attachments: received }, novaMsg, conversationId);
   res.status(200).json(novaMsg);
 });
 
@@ -264,6 +279,16 @@ app.all(["/bot:token/getMe", "/getMe"], (req, res) => {
 app.post("/api/v2/me/shipment/calculate", async (req, res) => {
   const body = req.body || {};
   const cep = (body.to && body.to.postal_code) ? String(body.to.postal_code).replace(/\D/g, "") : "01001000";
+  if (freteFixtureAtivo) {
+    const quotes = memoriaFretes.get(cep);
+    if (!quotes) {
+      const error = { error: 'Cotação real não semeada para este CEP', fonte: 'fixture_ausente' };
+      await registrarSaida('melhor_envio', req.originalUrl, 'POST', body, error, conversaFixtureFrete);
+      return res.status(422).json(error);
+    }
+    await registrarSaida('melhor_envio', req.originalUrl, 'POST', body, quotes, conversaFixtureFrete);
+    return res.json(quotes);
+  }
 
   // Preço e prazo determinísticos baseados na região do CEP
   const primeiroDigito = cep[0] || "7";
@@ -330,6 +355,16 @@ app.post("/semente/historico", (req, res) => {
   if (!conversa_id) {
     return res.status(400).json({ error: "conversa_id e obrigatorio" });
   }
+  if (Array.isArray(req.body.frete_fixture)) {
+    const fixtures = req.body.frete_fixture;
+    if (fixtures.some(f => !/^\d{8}$/.test(f.cep) || !Array.isArray(f.resposta) || !f.resposta.length || f.resposta.some(q => !q.name || !Number.isFinite(Number(q.price)) || Number(q.price)<0 || !Number.isInteger(q.delivery_time) || q.delivery_time<=0))) {
+      return res.status(400).json({error:'Fixture de frete inválida'});
+    }
+    memoriaFretes.clear();
+    for (const f of fixtures) memoriaFretes.set(f.cep, f.resposta);
+    freteFixtureAtivo = true;
+    conversaFixtureFrete = String(conversa_id);
+  }
 
   if (Array.isArray(mensagens)) {
     memoriaConversas.set(String(conversa_id), mensagens);
@@ -342,13 +377,14 @@ app.post("/semente/historico", (req, res) => {
     status: "ok",
     conversa_id: String(conversa_id),
     total_mensagens: (memoriaConversas.get(String(conversa_id)) || []).length,
+    fretes_semeados: memoriaFretes.size,
     labels: memoriaLabels.get(String(conversa_id)) || []
   });
 });
 
 // Consulta de registros
 app.get("/registro", (req, res) => {
-  const token = req.headers["authorization"] ? req.headers["authorization"].replace(/^Bearer\s+/i, "") : req.query.token;
+  const token = req.headers["authorization"] ? req.headers["authorization"].replace(/^Bearer\s+/i, "") : null;
   if (token !== REGISTRO_TOKEN) {
     return res.status(401).json({ error: "Nao autorizado" });
   }
@@ -366,7 +402,7 @@ app.get("/registro", (req, res) => {
 
 // Limpeza de memoria de registros
 app.delete("/registro", (req, res) => {
-  const token = req.headers["authorization"] ? req.headers["authorization"].replace(/^Bearer\s+/i, "") : req.query.token;
+  const token = req.headers["authorization"] ? req.headers["authorization"].replace(/^Bearer\s+/i, "") : null;
   if (token !== REGISTRO_TOKEN) {
     return res.status(401).json({ error: "Nao autorizado" });
   }
@@ -374,11 +410,16 @@ app.delete("/registro", (req, res) => {
   memoriaEventos.length = 0;
   memoriaConversas.clear();
   memoriaLabels.clear();
+  memoriaFretes.clear(); freteFixtureAtivo=false; conversaFixtureFrete=null;
   res.json({ status: "ok", message: "Registros limpos com sucesso" });
 });
 
 // Iniciar servidor
-app.listen(PORT, () => {
+app.use((err, req, res, next) => {
+  res.status(400).json({ error: 'Requisição de anexo inválida', code: err.code || 'INVALID_UPLOAD' });
+});
+module.exports = app;
+if (require.main === module) app.listen(PORT, () => {
   console.log(`Simulador de homologacao rodando na porta ${PORT}`);
   console.log(`- Supabase URL: ${SUPABASE_URL || 'Nao configurado'}`);
 });
